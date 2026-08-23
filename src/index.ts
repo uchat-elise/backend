@@ -68,7 +68,9 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   }
   console.warn(`[startup] ${message} Using in-memory test fallback.`);
 }
-const API_PORT = Number(process.env.API_PORT || 3000);
+const API_PORT = Number(process.env.API_PORT || process.env.PORT || 3000);
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || `http://localhost:${API_PORT}`).replace(/\/$/, '');
 const USE_SUPABASE = process.env.E2E_TEST_MODE !== 'true' && Boolean(SUPABASE_URL && SUPABASE_KEY);
 
 const supabase = USE_SUPABASE
@@ -86,7 +88,7 @@ function getRequestSupabaseClient(req: Request) {
 const socketServer = await createSocketServer({
   httpServer: server,
   path: '/api/socket.io',
-  corsOrigin: 'http://localhost:5173',
+  corsOrigin: FRONTEND_URL,
   supabaseUrl: USE_SUPABASE ? SUPABASE_URL : undefined,
   supabaseKey: USE_SUPABASE ? SUPABASE_KEY : undefined,
 });
@@ -585,7 +587,7 @@ async function findChatByParticipants(userAId: string, userBId: string) {
   return accepted ? chatId : null;
 }
 
-app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
+app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use('/api/storage', express.static(storageRoot));
 
@@ -605,7 +607,7 @@ app.post('/api/storage/uploads/request-url', (req: Request, res: Response) => {
     .replace(/^-+|-+$/g, '') || `upload-${Date.now()}`;
 
   const objectPath = `/uploads/${Date.now()}-${Math.random().toString(16).slice(2)}-${safeName}`;
-  const uploadURL = `http://localhost:${API_PORT}/api/storage${objectPath}`;
+  const uploadURL = `${PUBLIC_API_URL}/api/storage${objectPath}`;
   return res.json({ uploadURL, objectPath });
 });
 
