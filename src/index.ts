@@ -71,6 +71,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 const API_PORT = Number(process.env.API_PORT || process.env.PORT || 3000);
 const FRONTEND_URL = process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173';
 const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || `http://localhost:${API_PORT}`).replace(/\/$/, '');
+const EMAIL_VERIFICATION_ENABLED = process.env.EMAIL_VERIFICATION_ENABLED === 'true';
 const USE_SUPABASE = process.env.E2E_TEST_MODE !== 'true' && Boolean(SUPABASE_URL && SUPABASE_KEY);
 
 const supabase = USE_SUPABASE
@@ -851,12 +852,12 @@ app.post('/api/auth/register', async (req, res) => {
     if (existing) return res.status(400).json({ error: 'Email or username already exists' });
 
     const { data, error } = await supabase.from('users').insert([
-      { email, username, display_name: displayName, password_hash: hashPassword(password), email_verified: false },
+      { email, username, display_name: displayName, password_hash: hashPassword(password), email_verified: !EMAIL_VERIFICATION_ENABLED },
     ]).select('id').single();
 
     if (error || !data) return res.status(500).json({ error: error?.message ?? 'Registration failed' });
 
-    return res.json({ message: 'Verification email sent', userId: data.id });
+    return res.json({ message: EMAIL_VERIFICATION_ENABLED ? 'Verification email sent' : 'Account created', userId: data.id, verificationRequired: EMAIL_VERIFICATION_ENABLED });
   }
 
   const existingLocal = inMemoryUsers.find((u) => u.email === email || u.username === username);
@@ -870,14 +871,18 @@ app.post('/api/auth/register', async (req, res) => {
     profile_picture: null,
     created_at: new Date().toISOString(),
     password_hash: hashPassword(password),
-    email_verified: false,
+    email_verified: !EMAIL_VERIFICATION_ENABLED,
     last_seen: null,
     hide_last_seen: false,
   };
   inMemoryUsers.push(newUser);
+  if (!EMAIL_VERIFICATION_ENABLED) {
+    return res.json({ message: 'Account created', userId: newUser.id, verificationRequired: false });
+  }
+
   const verificationToken = crypto.randomUUID();
   inMemoryVerificationTokens.set(verificationToken, newUser.id);
-  return res.json({ message: 'Verification email sent', userId: newUser.id, verificationToken });
+  return res.json({ message: 'Verification email sent', userId: newUser.id, verificationToken, verificationRequired: true });
 });
 
 async function authenticateUserWithIdentifier(identifier: string, password: string) {
@@ -906,7 +911,7 @@ async function authenticateUserWithIdentifier(identifier: string, password: stri
       return { status: 401, body: { error: 'Invalid credentials' } };
     }
 
-    if (!user.email_verified) {
+    if (EMAIL_VERIFICATION_ENABLED && !user.email_verified) {
       return { status: 403, body: { error: 'Email not verified' } };
     }
 
@@ -945,7 +950,7 @@ async function authenticateUserWithIdentifier(identifier: string, password: stri
     return { status: 401, body: { error: 'Invalid credentials' } };
   }
 
-  if (!user.email_verified) {
+  if (EMAIL_VERIFICATION_ENABLED && !user.email_verified) {
     return { status: 403, body: { error: 'Email not verified' } };
   }
 
