@@ -146,12 +146,13 @@ function createSessionToken(userId: string, username: string) {
   return `uchat_${payload}.${signature}`;
 }
 
-function createSupabaseAccessToken(user: { id: string; email: string }) {
+function createSupabaseAccessToken(user: { id: string; email: string; username: string }) {
   const secret = process.env.SUPABASE_JWT_SECRET || process.env.JWT_SECRET || JWT_SECRET_FALLBACK;
   const now = Math.floor(Date.now() / 1000);
   return jwt.sign({
     sub: user.id,
     email: user.email,
+    username: user.username,
     role: 'authenticated',
     iss: 'supabase',
     iat: now,
@@ -213,6 +214,17 @@ function getAuthenticatedUsername(req: Request): string | null {
   if (bearer) {
     const session = resolveTokenSession(bearer);
     if (session?.username) return session.username;
+
+    try {
+      const payload = jwt.verify(
+        bearer,
+        process.env.SUPABASE_JWT_SECRET || process.env.JWT_SECRET || JWT_SECRET_FALLBACK,
+        { algorithms: ['HS256'] },
+      ) as { username?: unknown };
+      if (typeof payload.username === 'string' && payload.username) return payload.username;
+    } catch {
+      // Fall back to the legacy x-username header below.
+    }
   }
 
   if (xUser) return xUser;
@@ -898,7 +910,7 @@ async function authenticateUserWithIdentifier(identifier: string, password: stri
       return { status: 403, body: { error: 'Email not verified' } };
     }
 
-    const accessToken = createSupabaseAccessToken({ id: user.id, email: user.email });
+    const accessToken = createSupabaseAccessToken({ id: user.id, email: user.email, username: user.username });
     return {
       status: 200,
       body: {
@@ -937,7 +949,7 @@ async function authenticateUserWithIdentifier(identifier: string, password: stri
     return { status: 403, body: { error: 'Email not verified' } };
   }
 
-  const accessToken = createSupabaseAccessToken({ id: user.id, email: user.email });
+  const accessToken = createSupabaseAccessToken({ id: user.id, email: user.email, username: user.username });
   return {
     status: 200,
     body: {
