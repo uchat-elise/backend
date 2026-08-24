@@ -600,6 +600,19 @@ async function findChatByParticipants(userAId: string, userBId: string) {
   return accepted ? chatId : null;
 }
 
+async function ensureChatThread(userAId: string, userBId: string) {
+  const chatId = getChatIdForUsers(userAId, userBId);
+  if (!USE_SUPABASE || !supabase) return chatId;
+
+  const { error } = await supabase.from('chat_threads').upsert({
+    id: chatId,
+    user_a: userAId,
+    user_b: userBId,
+  }, { onConflict: 'id', ignoreDuplicates: true });
+  if (error) throw error;
+  return chatId;
+}
+
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use('/api/storage', express.static(storageRoot));
@@ -1672,7 +1685,7 @@ app.post('/api/friends/requests/:requestId/accept', async (req: Request, res: Re
 
       const updated = await updateFriendRequestStatus(requestId, 'accepted');
     const otherUser = await getUserById(request.senderId);
-    const chatId = getChatIdForUsers(currentUser.id, request.senderId);
+    const chatId = await ensureChatThread(currentUser.id, request.senderId);
     const payload = {
       request: {
         ...updated,
