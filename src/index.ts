@@ -92,6 +92,7 @@ const socketServer = await createSocketServer({
   corsOrigin: FRONTEND_URL,
   supabaseUrl: USE_SUPABASE ? SUPABASE_URL : undefined,
   supabaseKey: USE_SUPABASE ? SUPABASE_KEY : undefined,
+  supabaseServiceRoleKey: USE_SUPABASE ? process.env.SUPABASE_SERVICE_ROLE_KEY : undefined,
 });
 const io = socketServer.io;
 

@@ -205,6 +205,7 @@ export interface SocketServerOptions {
   corsOrigin?: string;
   supabaseUrl?: string;
   supabaseKey?: string;
+  supabaseServiceRoleKey?: string;
   httpServer?: http.Server;
   persistMessage?: (message: { id: string; room: string; senderId: string; content: string; timestamp: string }) => Promise<void>;
 }
@@ -220,6 +221,7 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
   const isTestMode = process.env.E2E_TEST_MODE === 'true' || process.env.NODE_ENV === 'test';
   const supabaseUrl = options.supabaseUrl ?? process.env.SUPABASE_URL;
   const supabaseKey = options.supabaseKey ?? process.env.SUPABASE_ANON_KEY ?? process.env.SUPABASE_KEY;
+  const supabaseServiceRoleKey = options.supabaseServiceRoleKey ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
   if ((!supabaseUrl || !supabaseKey) && !isTestMode) throw new Error('Missing required Supabase environment variables: SUPABASE_URL and SUPABASE_KEY or SUPABASE_ANON_KEY.');
 
   const ownsHttpServer = !options.httpServer;
@@ -230,6 +232,9 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
     transports: ['websocket', 'polling'],
   });
   const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false } }) : null;
+  const supabaseAdmin = supabaseUrl && supabaseServiceRoleKey
+    ? createClient(supabaseUrl, supabaseServiceRoleKey, { auth: { persistSession: false } })
+    : null;
   const intervals = new Set<ReturnType<typeof setInterval>>();
 
   io.use(async (socket, next) => {
@@ -283,8 +288,9 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
         socket.emit('room_error', { code: 'ROOM_NOT_FOUND', message: 'Room is required' });
         return;
       }
-      if (data.supabase) {
-        const { data: thread, error } = await data.supabase.from('chat_threads').select('id').eq('id', room).or(`user_a.eq.${userId},user_b.eq.${userId}`).maybeSingle();
+      const roomClient = supabaseAdmin ?? data.supabase;
+      if (roomClient) {
+        const { data: thread, error } = await roomClient.from('chat_threads').select('id').eq('id', room).or(`user_a.eq.${userId},user_b.eq.${userId}`).maybeSingle();
         if (error || !thread) {
           ack?.({ ok: false, code: 'ROOM_NOT_FOUND' });
           socket.emit('room_error', { code: 'ROOM_NOT_FOUND', message: 'Room not found or access denied' });
