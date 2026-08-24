@@ -539,6 +539,7 @@ async function getAcceptedFriendChats(currentUserId: string) {
     if (error) throw error;
     const ids = (data ?? []).flatMap((request: any) => [request.sender_id, request.receiver_id]).filter((id: string) => id !== currentUserId);
     const uniqueIds = Array.from(new Set(ids));
+    await Promise.all(uniqueIds.map((otherUserId) => ensureChatThread(currentUserId, otherUserId)));
     const users = uniqueIds.length > 0 ? await (async () => {
       const { data: userData, error: usersError } = await supabase
         .from('users')
