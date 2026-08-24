@@ -69,7 +69,7 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.warn(`[startup] ${message} Using in-memory test fallback.`);
 }
 const API_PORT = Number(process.env.API_PORT || process.env.PORT || 3000);
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+const FRONTEND_URL = process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173';
 const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || `http://localhost:${API_PORT}`).replace(/\/$/, '');
 const USE_SUPABASE = process.env.E2E_TEST_MODE !== 'true' && Boolean(SUPABASE_URL && SUPABASE_KEY);
 
@@ -943,6 +943,7 @@ async function authenticateUserWithIdentifier(identifier: string, password: stri
     body: {
       access_token: accessToken,
       token: accessToken,
+      supabase_access_token: accessToken,
       user: {
         id: user.id,
         email: user.email,
