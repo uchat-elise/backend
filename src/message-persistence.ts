@@ -11,6 +11,11 @@ export interface MessagePayload {
   status?: MessageStatus;
   created_at?: string;
   client_message_id?: string;
+  audio_url?: string | null;
+  voice_note?: boolean;
+  voice_duration?: number | null;
+  voice_mime_type?: string | null;
+  voice_size?: number | null;
 }
 
 function assertUuid(value: string, fieldName: string) {
@@ -37,6 +42,11 @@ export async function saveMessage(
     status: payload.status ?? 'sent',
     created_at: createdAt,
     client_message_id: clientMessageId,
+    audio_url: payload.audio_url ?? null,
+    voice_note: payload.voice_note ?? false,
+    voice_duration: payload.voice_duration ?? null,
+    voice_mime_type: payload.voice_mime_type ?? null,
+    voice_size: payload.voice_size ?? null,
   };
 
   const { data, error } = await supabase

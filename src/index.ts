@@ -8,7 +8,7 @@ import jwt from 'jsonwebtoken';
 import { type Socket } from 'socket.io';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { activeSockets, createSocketServer, getPrivateRoomId, verifySocketAuthToken } from './socket-server';
 import { getVisibleLastSeen, shouldRefreshLastSeen } from './last-seen';
 import { createMessagePayload, persistMessageWithTransaction, resolveReceiverSocketId, socketUserIdMap } from './message-flow';
@@ -71,7 +71,6 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 const API_PORT = Number(process.env.API_PORT || process.env.PORT || 3000);
 const FRONTEND_URL = process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173';
 const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || `http://localhost:${API_PORT}`).replace(/\/$/, '');
-const EMAIL_VERIFICATION_ENABLED = process.env.EMAIL_VERIFICATION_ENABLED === 'true';
 const USE_SUPABASE = process.env.E2E_TEST_MODE !== 'true' && Boolean(SUPABASE_URL && SUPABASE_KEY);
 
 const supabase = USE_SUPABASE
@@ -83,7 +82,10 @@ function getRequestSupabaseClient(req: Request) {
   const authHeader = String(req.headers.authorization ?? '').trim();
   const accessToken = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length).trim() : '';
   if (!accessToken) return supabase;
-  return supabase;
+  return createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: `Bearer ${accessToken}` } },
+  });
 }
 
 const socketServer = await createSocketServer({
@@ -92,7 +94,11 @@ const socketServer = await createSocketServer({
   corsOrigin: FRONTEND_URL,
   supabaseUrl: USE_SUPABASE ? SUPABASE_URL : undefined,
   supabaseKey: USE_SUPABASE ? SUPABASE_KEY : undefined,
-  supabaseServiceRoleKey: USE_SUPABASE ? process.env.SUPABASE_SERVICE_ROLE_KEY : undefined,
+  persistVoiceNote: async (message) => savePrivateMessage(message),
+  persistGlobalMessage: (message, client) => persistGlobalMessage(message, client),
+  updateGlobalMessage: (messageId, userId, content, client) => updateGlobalMessage(messageId, userId, content, client),
+  deleteGlobalMessage: (messageId, userId, client) => deleteGlobalMessage(messageId, userId, client),
+  toggleGlobalReaction: (messageId, userId, emoji, client) => toggleGlobalReaction(messageId, userId, emoji, client),
 });
 const io = socketServer.io;
 
@@ -148,13 +154,13 @@ function createSessionToken(userId: string, username: string) {
   return `uchat_${payload}.${signature}`;
 }
 
-function createSupabaseAccessToken(user: { id: string; email: string; username: string }) {
+function createSupabaseAccessToken(user: { id: string; email: string; username?: string }) {
   const secret = process.env.SUPABASE_JWT_SECRET || process.env.JWT_SECRET || JWT_SECRET_FALLBACK;
   const now = Math.floor(Date.now() / 1000);
   return jwt.sign({
     sub: user.id,
     email: user.email,
-    username: user.username,
+    ...(user.username ? { username: user.username } : {}),
     role: 'authenticated',
     iss: 'supabase',
     iat: now,
@@ -216,17 +222,6 @@ function getAuthenticatedUsername(req: Request): string | null {
   if (bearer) {
     const session = resolveTokenSession(bearer);
     if (session?.username) return session.username;
-
-    try {
-      const payload = jwt.verify(
-        bearer,
-        process.env.SUPABASE_JWT_SECRET || process.env.JWT_SECRET || JWT_SECRET_FALLBACK,
-        { algorithms: ['HS256'] },
-      ) as { username?: unknown };
-      if (typeof payload.username === 'string' && payload.username) return payload.username;
-    } catch {
-      // Fall back to the legacy x-username header below.
-    }
   }
 
   if (xUser) return xUser;
@@ -539,11 +534,10 @@ async function getAcceptedFriendChats(currentUserId: string) {
     if (error) throw error;
     const ids = (data ?? []).flatMap((request: any) => [request.sender_id, request.receiver_id]).filter((id: string) => id !== currentUserId);
     const uniqueIds = Array.from(new Set(ids));
-    await Promise.all(uniqueIds.map((otherUserId) => ensureChatThread(currentUserId, otherUserId)));
     const users = uniqueIds.length > 0 ? await (async () => {
       const { data: userData, error: usersError } = await supabase
         .from('users')
-        .select('id,username,display_name,profile_picture,last_seen,hide_last_seen,show_online_status')
+        .select('id,username,display_name,profile_picture,avatar_url,last_seen,hide_last_seen,show_online_status')
         .in('id', uniqueIds);
       if (usersError) throw usersError;
       return userData ?? [];
@@ -554,7 +548,7 @@ async function getAcceptedFriendChats(currentUserId: string) {
         id: user.id,
         username: user.username,
         displayName: user.display_name ?? user.username,
-        profilePicture: user.profile_picture ?? null,
+        profilePicture: user.profile_picture ?? user.avatar_url ?? null,
         lastSeen: user.last_seen ?? null,
         hideLastSeen: Boolean(user.hide_last_seen),
         showOnlineStatus: user.show_online_status !== false,
@@ -602,29 +596,36 @@ async function findChatByParticipants(userAId: string, userBId: string) {
   return accepted ? chatId : null;
 }
 
-async function ensureChatThread(userAId: string, userBId: string) {
-  const chatId = getChatIdForUsers(userAId, userBId);
-  if (!USE_SUPABASE || !supabase) return chatId;
-
-  const { error } = await supabase.from('chat_threads').upsert({
-    id: chatId,
-    user_a: userAId,
-    user_b: userBId,
-  }, { onConflict: 'id', ignoreDuplicates: true });
-  if (error) throw error;
-  return chatId;
-}
-
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use('/api/storage', express.static(storageRoot));
 
-app.post('/api/storage/uploads/request-url', (req: Request, res: Response) => {
+app.post('/api/voice-notes', express.raw({ type: ['audio/*'], limit: '5mb' }), async (req: Request, res: Response) => {
+  const currentUser = await getAuthenticatedUserFromRequest(req, true);
+  if (!currentUser) return res.status(401).json({ error: 'Unauthorized' });
+  const mimeType = String(req.headers['content-type'] ?? '').split(';')[0].toLowerCase();
+  if (!/^audio\/(webm|ogg|mp4|mpeg|aac|wav)$/.test(mimeType)) return res.status(415).json({ error: 'Unsupported audio format' });
+  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body ?? []);
+  if (body.length === 0) return res.status(400).json({ error: 'Empty audio recording' });
+  const extension = mimeType.includes('mp4') || mimeType.includes('aac') ? 'm4a' : mimeType.includes('ogg') ? 'ogg' : 'webm';
+  const relativePath = `uploads/voice-${currentUser.id}-${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  const targetPath = path.join(storageRoot, relativePath);
+  fs.writeFileSync(targetPath, body);
+  return res.json({ audioUrl: `${PUBLIC_API_URL}/api/storage/${relativePath}`, size: body.length, mimeType, extension });
+});
+
+app.post('/api/storage/uploads/request-url', async (req: Request, res: Response) => {
+  const currentUser = await getAuthenticatedUserFromRequest(req, true);
+  if (!currentUser) return res.status(401).json({ error: 'Unauthorized' });
+
   const fileName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
   const fileSize = Number(req.body?.size ?? 0);
+  const contentType = typeof req.body?.contentType === 'string' ? req.body.contentType.toLowerCase() : '';
 
   if (!fileName) return res.status(400).json({ error: 'Missing file name' });
   if (!Number.isFinite(fileSize) || fileSize <= 0) return res.status(400).json({ error: 'Missing file size' });
+  if (fileSize > 5 * 1024 * 1024) return res.status(413).json({ error: 'Profile image must be under 5 MB' });
+  if (!contentType.startsWith('image/')) return res.status(415).json({ error: 'Profile image must be an image' });
 
   const safeName = fileName
     .replace(/\\/g, '/')
@@ -639,7 +640,10 @@ app.post('/api/storage/uploads/request-url', (req: Request, res: Response) => {
   return res.json({ uploadURL, objectPath });
 });
 
-app.put('/api/storage/*', express.raw({ type: '*/*', limit: '10mb' }), (req: Request, res: Response) => {
+app.put('/api/storage/*', express.raw({ type: '*/*', limit: '10mb' }), async (req: Request, res: Response) => {
+  const currentUser = await getAuthenticatedUserFromRequest(req, true);
+  if (!currentUser) return res.status(401).json({ error: 'Unauthorized' });
+
   const relativePath = decodeURIComponent((req as any).path || '').replace(/^\/api\/storage\/?/, '');
   if (!relativePath) return res.status(400).json({ error: 'Missing upload path' });
 
@@ -867,12 +871,27 @@ app.post('/api/auth/register', async (req, res) => {
     if (existing) return res.status(400).json({ error: 'Email or username already exists' });
 
     const { data, error } = await supabase.from('users').insert([
-      { email, username, display_name: displayName, password_hash: hashPassword(password), email_verified: !EMAIL_VERIFICATION_ENABLED },
+      { email, username, display_name: displayName, password_hash: hashPassword(password), email_verified: true },
     ]).select('id').single();
 
     if (error || !data) return res.status(500).json({ error: error?.message ?? 'Registration failed' });
 
-    return res.json({ message: EMAIL_VERIFICATION_ENABLED ? 'Verification email sent' : 'Account created', userId: data.id, verificationRequired: EMAIL_VERIFICATION_ENABLED });
+    const accessToken = createSupabaseAccessToken({ id: data.id, email, username });
+    return res.json({
+      message: 'Registration successful',
+      userId: data.id,
+      access_token: accessToken,
+      token: accessToken,
+      user: {
+        id: data.id,
+        email,
+        username,
+        displayName,
+        profilePicture: null,
+        hideLastSeen: false,
+        showOnlineStatus: true,
+      },
+    });
   }
 
   const existingLocal = inMemoryUsers.find((u) => u.email === email || u.username === username);
@@ -886,18 +905,29 @@ app.post('/api/auth/register', async (req, res) => {
     profile_picture: null,
     created_at: new Date().toISOString(),
     password_hash: hashPassword(password),
-    email_verified: !EMAIL_VERIFICATION_ENABLED,
+    email_verified: true,
     last_seen: null,
     hide_last_seen: false,
   };
   inMemoryUsers.push(newUser);
-  if (!EMAIL_VERIFICATION_ENABLED) {
-    return res.json({ message: 'Account created', userId: newUser.id, verificationRequired: false });
-  }
-
-  const verificationToken = crypto.randomUUID();
-  inMemoryVerificationTokens.set(verificationToken, newUser.id);
-  return res.json({ message: 'Verification email sent', userId: newUser.id, verificationToken, verificationRequired: true });
+  const accessToken = createSupabaseAccessToken({ id: newUser.id, email: newUser.email, username: newUser.username });
+  return res.json({
+    message: 'Registration successful',
+    userId: newUser.id,
+    access_token: accessToken,
+    token: accessToken,
+    supabase_access_token: accessToken,
+    user: {
+      id: newUser.id,
+      email: newUser.email,
+      username: newUser.username,
+      displayName: newUser.display_name,
+      profilePicture: null,
+      hideLastSeen: false,
+      showOnlineStatus: true,
+      createdAt: newUser.created_at,
+    },
+  });
 });
 
 async function authenticateUserWithIdentifier(identifier: string, password: string) {
@@ -926,7 +956,7 @@ async function authenticateUserWithIdentifier(identifier: string, password: stri
       return { status: 401, body: { error: 'Invalid credentials' } };
     }
 
-    if (EMAIL_VERIFICATION_ENABLED && !user.email_verified) {
+    if (!user.email_verified) {
       return { status: 403, body: { error: 'Email not verified' } };
     }
 
@@ -965,7 +995,7 @@ async function authenticateUserWithIdentifier(identifier: string, password: stri
     return { status: 401, body: { error: 'Invalid credentials' } };
   }
 
-  if (EMAIL_VERIFICATION_ENABLED && !user.email_verified) {
+  if (!user.email_verified) {
     return { status: 403, body: { error: 'Email not verified' } };
   }
 
@@ -1245,12 +1275,157 @@ const inMemoryPrivateMessages: Array<{
   attachments?: unknown;
   voice_note?: boolean;
   voice_duration?: number | null;
+  audio_url?: string | null;
+  voice_mime_type?: string | null;
+  voice_size?: number | null;
   unsent?: boolean;
   created_at: string;
   updated_at: string;
   edited: boolean;
   reply_to: string | null;
 }> = [];
+
+type GlobalMessageRecord = {
+  id: string;
+  sender_id: string;
+  sender_name: string;
+  content: string;
+  attachments: unknown;
+  reactions: Array<{ emoji: string; count: number; users: string[] }>;
+  voice_note: boolean;
+  voice_duration: number | null;
+  audio_url: string | null;
+  voice_mime_type: string | null;
+  voice_size: number | null;
+  client_message_id: string | null;
+  unsent: boolean;
+  edited: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+const inMemoryGlobalMessages: GlobalMessageRecord[] = [];
+
+function toGlobalMessage(record: GlobalMessageRecord) {
+  return {
+    id: record.id,
+    senderName: record.sender_name,
+    message: record.voice_note ? record.audio_url ?? '' : record.content,
+    timestamp: record.created_at,
+    unsent: record.unsent,
+    edited: record.edited,
+    attachments: record.attachments ?? undefined,
+    reactions: record.reactions,
+    voiceNote: record.voice_note,
+    voiceDuration: record.voice_duration,
+    audioUrl: record.audio_url,
+  };
+}
+
+async function persistGlobalMessage(message: {
+  id: string;
+  senderId: string;
+  senderName: string;
+  content: string;
+  timestamp: string;
+  clientMessageId?: string;
+  attachments?: unknown;
+  voiceNote?: boolean;
+  voiceDuration?: number | null;
+  audioUrl?: string | null;
+  voiceMimeType?: string;
+  voiceSize?: number;
+}, client: SupabaseClient | null) {
+  if (USE_SUPABASE && client) {
+    const { error } = await client.from('global_messages').upsert({
+      id: message.id,
+      sender_id: message.senderId,
+      content: message.content,
+      attachments: message.attachments ?? null,
+      voice_note: message.voiceNote ?? false,
+      voice_duration: message.voiceDuration ?? null,
+      audio_url: message.audioUrl ?? null,
+      voice_mime_type: message.voiceMimeType ?? null,
+      voice_size: message.voiceSize ?? null,
+      client_message_id: message.clientMessageId ?? crypto.randomUUID(),
+      created_at: message.timestamp,
+      updated_at: message.timestamp,
+    }, { onConflict: 'client_message_id' });
+    if (error) throw error;
+    return;
+  }
+
+  inMemoryGlobalMessages.push({
+    id: message.id,
+    sender_id: message.senderId,
+    sender_name: message.senderName,
+    content: message.content,
+    attachments: message.attachments ?? null,
+    reactions: [],
+    voice_note: message.voiceNote ?? false,
+    voice_duration: message.voiceDuration ?? null,
+    audio_url: message.audioUrl ?? null,
+    voice_mime_type: message.voiceMimeType ?? null,
+    voice_size: message.voiceSize ?? null,
+    client_message_id: message.clientMessageId ?? null,
+    unsent: false,
+    edited: false,
+    created_at: message.timestamp,
+    updated_at: message.timestamp,
+  });
+}
+
+async function updateGlobalMessage(messageId: string, userId: string, content: string, client: SupabaseClient | null) {
+  if (USE_SUPABASE && client) {
+    const { data, error } = await client.from('global_messages').update({ content, edited: true, updated_at: new Date().toISOString() }).eq('id', messageId).eq('sender_id', userId).select('id').maybeSingle();
+    if (error) throw error;
+    return Boolean(data);
+  }
+  const message = inMemoryGlobalMessages.find((item) => item.id === messageId && item.sender_id === userId && !item.unsent);
+  if (!message) return false;
+  message.content = content;
+  message.edited = true;
+  message.updated_at = new Date().toISOString();
+  return true;
+}
+
+async function deleteGlobalMessage(messageId: string, userId: string, client: SupabaseClient | null) {
+  if (USE_SUPABASE && client) {
+    const { data, error } = await client.from('global_messages').update({ unsent: true, content: 'This message was deleted', updated_at: new Date().toISOString() }).eq('id', messageId).eq('sender_id', userId).select('id').maybeSingle();
+    if (error) throw error;
+    return Boolean(data);
+  }
+  const message = inMemoryGlobalMessages.find((item) => item.id === messageId && item.sender_id === userId && !item.unsent);
+  if (!message) return false;
+  message.unsent = true;
+  message.content = 'This message was deleted';
+  message.updated_at = new Date().toISOString();
+  return true;
+}
+
+async function toggleGlobalReaction(messageId: string, userId: string, emoji: string, client: SupabaseClient | null) {
+  if (USE_SUPABASE && client) {
+    const { data: message, error: readError } = await client.from('global_messages').select('reactions').eq('id', messageId).maybeSingle();
+    if (readError) throw readError;
+    const reactions = Array.isArray(message?.reactions) ? message.reactions as Array<{ emoji: string; count: number; users: string[] }> : [];
+    const current = reactions.find((reaction) => reaction.emoji === emoji);
+    if (current?.users.includes(userId)) current.users = current.users.filter((id) => id !== userId);
+    else if (current) { current.users.push(userId); current.count = current.users.length; }
+    else reactions.push({ emoji, count: 1, users: [userId] });
+    const normalized = reactions.filter((reaction) => reaction.users.length > 0).map((reaction) => ({ ...reaction, count: reaction.users.length }));
+    const { error } = await client.from('global_messages').update({ reactions: normalized }).eq('id', messageId);
+    if (error) throw error;
+    return normalized;
+  }
+  const message = inMemoryGlobalMessages.find((item) => item.id === messageId && !item.unsent);
+  if (!message) return [];
+  const current = message.reactions.find((reaction) => reaction.emoji === emoji);
+  if (current?.users.includes(userId)) current.users = current.users.filter((id) => id !== userId);
+  else if (current) { current.users.push(userId); current.count = current.users.length; }
+  else message.reactions.push({ emoji, count: 1, users: [userId] });
+  message.reactions = message.reactions.filter((reaction) => reaction.users.length > 0).map((reaction) => ({ ...reaction, count: reaction.users.length }));
+  return message.reactions;
+}
 
 async function savePrivateMessage(message: any) {
   // Generate seq locally (works for both Supabase and in-memory modes)
@@ -1278,6 +1453,11 @@ async function savePrivateMessage(message: any) {
         status: 'sent',
         created_at: message.timestamp,
         client_message_id: clientMessageId,
+        audio_url: message.audioUrl ?? null,
+        voice_note: message.voiceNote ?? false,
+        voice_duration: message.voiceDuration ?? null,
+        voice_mime_type: message.voiceMimeType ?? null,
+        voice_size: message.voiceSize ?? null,
       }, clientMessageId);
 
       message.dbId = realtimeMessageId;
@@ -1303,6 +1483,9 @@ async function savePrivateMessage(message: any) {
     attachments: message.attachments ?? null,
     voice_note: message.voiceNote ?? false,
     voice_duration: message.voiceDuration ?? null,
+    audio_url: message.audioUrl ?? null,
+    voice_mime_type: message.voiceMimeType ?? null,
+    voice_size: message.voiceSize ?? null,
     unsent: message.unsent ?? false,
     created_at: message.timestamp,
     updated_at: message.timestamp,
@@ -1340,7 +1523,7 @@ async function getPrivateMessageById(messageId: string) {
   if (USE_SUPABASE && supabase) {
     const { data, error } = await supabase
       .from('messages')
-      .select('id,chat_id,sender_id,content,status,created_at,client_message_id')
+      .select('id,chat_id,sender_id,content,status,created_at,client_message_id,voice_note,audio_url,voice_duration,voice_mime_type,voice_size')
       .eq('id', messageId)
       .maybeSingle();
     if (error) throw error;
@@ -1352,8 +1535,11 @@ async function getPrivateMessageById(messageId: string) {
       sender_display_name: null,
       content: data.content,
       attachments: undefined,
-      voice_note: false,
-      voice_duration: null,
+      voice_note: Boolean(data.voice_note),
+      voice_duration: data.voice_duration ?? null,
+      audio_url: data.audio_url ?? null,
+      voice_mime_type: data.voice_mime_type ?? null,
+      voice_size: data.voice_size ?? null,
       unsent: false,
       created_at: data.created_at,
       updated_at: data.created_at,
@@ -1431,7 +1617,7 @@ async function getPrivateMessagesForChat(chatId: string, currentUsername?: strin
     if (!messageClient) throw new Error('Supabase client is not initialized');
     const { data: messages, error } = await messageClient
       .from('messages')
-      .select('id,chat_id,sender_id,content,status,created_at,client_message_id')
+      .select('id,chat_id,sender_id,content,status,created_at,client_message_id,voice_note,audio_url,voice_duration,voice_mime_type,voice_size')
       .eq('chat_id', chatId)
       .order('created_at', { ascending: true });
     if (!error && messages) {
@@ -1499,8 +1685,11 @@ async function getPrivateMessagesForChat(chatId: string, currentUsername?: strin
         senderName: message.sender_id,
         content: message.content,
         attachments: undefined,
-        voiceNote: false,
-        voiceDuration: null,
+        voiceNote: Boolean(message.voice_note),
+        audioUrl: message.audio_url ?? null,
+        voiceDuration: message.voice_duration ?? null,
+        voiceMimeType: message.voice_mime_type ?? null,
+        voiceSize: message.voice_size ?? null,
         unsent: false,
         createdAt: message.created_at,
         status: (message.status ?? 'sent') as 'sent' | 'delivered' | 'read',
@@ -1531,6 +1720,9 @@ async function getPrivateMessagesForChat(chatId: string, currentUsername?: strin
         attachments: message.attachments ?? undefined,
         voiceNote: message.voice_note ?? false,
         voiceDuration: message.voice_duration ?? null,
+        audioUrl: message.audio_url ?? null,
+        voiceMimeType: message.voice_mime_type ?? null,
+        voiceSize: message.voice_size ?? null,
         unsent: message.unsent ?? false,
         createdAt: message.created_at,
         status: 'delivered' as const,
@@ -1687,7 +1879,7 @@ app.post('/api/friends/requests/:requestId/accept', async (req: Request, res: Re
 
       const updated = await updateFriendRequestStatus(requestId, 'accepted');
     const otherUser = await getUserById(request.senderId);
-    const chatId = await ensureChatThread(currentUser.id, request.senderId);
+    const chatId = getChatIdForUsers(currentUser.id, request.senderId);
     const payload = {
       request: {
         ...updated,
@@ -1865,6 +2057,62 @@ app.get('/api/users/search', async (req: Request, res: Response) => {
   } catch (error) {
     res.status(500).json({ error: (error as Error).message || 'Unable to search users' });
   }
+});
+
+app.get('/api/messages', async (req: Request, res: Response) => {
+  const currentUser = await getAuthenticatedUserFromRequest(req, true);
+  if (!currentUser) return res.status(401).json({ error: 'Unauthorized' });
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 100)));
+  const before = typeof req.query.before === 'string' ? req.query.before : null;
+  if (before && Number.isNaN(Date.parse(before))) return res.status(400).json({ error: 'Invalid before timestamp' });
+
+  try {
+    if (USE_SUPABASE && supabase) {
+      let query = supabase.from('global_messages').select('id,sender_id,content,attachments,reactions,voice_note,voice_duration,audio_url,voice_mime_type,voice_size,unsent,edited,created_at').order('created_at', { ascending: false }).limit(limit + 1);
+      if (before) query = query.lt('created_at', before);
+      const { data, error } = await query;
+      if (error) throw error;
+      const rows = (data ?? []).slice(0, limit);
+      const messages = await Promise.all(rows.reverse().map(async (row: any) => {
+        const sender = await getUserById(row.sender_id);
+        return {
+          id: row.id,
+          senderName: sender?.username ?? row.sender_id,
+          message: row.voice_note ? row.audio_url : row.content,
+          timestamp: row.created_at,
+          unsent: Boolean(row.unsent),
+          edited: Boolean(row.edited),
+          attachments: row.attachments ?? undefined,
+          reactions: row.reactions ?? [],
+          voiceNote: Boolean(row.voice_note),
+          voiceDuration: row.voice_duration ?? null,
+          audioUrl: row.audio_url ?? null,
+          voiceMimeType: row.voice_mime_type ?? null,
+          voiceSize: row.voice_size ?? null,
+        };
+      }));
+      return res.json({ messages, hasMore: (data ?? []).length > limit });
+    }
+
+    const eligible = inMemoryGlobalMessages
+      .filter((message) => !before || message.created_at < before)
+      .sort((left, right) => right.created_at.localeCompare(left.created_at));
+    const messages = eligible.slice(0, limit).reverse().map(toGlobalMessage);
+    return res.json({ messages, hasMore: eligible.length > limit });
+  } catch (error) {
+    return res.status(500).json({ error: (error as Error).message || 'Unable to load global messages' });
+  }
+});
+
+app.get('/api/messages/stats', async (req: Request, res: Response) => {
+  const currentUser = await getAuthenticatedUserFromRequest(req, true);
+  if (!currentUser) return res.status(401).json({ error: 'Unauthorized' });
+  if (USE_SUPABASE && supabase) {
+    const { count, error } = await supabase.from('global_messages').select('id', { count: 'exact', head: true });
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ onlineCount: getOnlineUsers().length, totalMessages: count ?? 0, activeRooms: 1 });
+  }
+  return res.json({ onlineCount: getOnlineUsers().length, totalMessages: inMemoryGlobalMessages.length, activeRooms: 1 });
 });
 
 app.get('/api/messages/sync', async (req: Request, res: Response) => {

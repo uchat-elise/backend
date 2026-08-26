@@ -208,7 +208,29 @@ export interface SocketServerOptions {
   supabaseServiceRoleKey?: string;
   httpServer?: http.Server;
   persistMessage?: (message: { id: string; room: string; senderId: string; content: string; timestamp: string }) => Promise<void>;
+  persistVoiceNote?: (message: { id: string; room: string; senderId: string; content: string; timestamp: string; voiceNote: true; audioUrl: string; voiceDuration: number; voiceMimeType: string; voiceSize: number; clientMessageId?: string }) => Promise<void>;
+  persistGlobalMessage?: (message: GlobalSocketMessage, client: SupabaseClient | null) => Promise<void>;
+  updateGlobalMessage?: (messageId: string, userId: string, content: string, client: SupabaseClient | null) => Promise<boolean>;
+  deleteGlobalMessage?: (messageId: string, userId: string, client: SupabaseClient | null) => Promise<boolean>;
+  toggleGlobalReaction?: (messageId: string, userId: string, emoji: string, client: SupabaseClient | null) => Promise<unknown>;
 }
+
+type GlobalSocketMessage = {
+  id: string;
+  room: 'global';
+  senderId: string;
+  senderName: string;
+  message: string;
+  content: string;
+  timestamp: string;
+  clientMessageId?: string;
+  attachments?: unknown;
+  voiceNote?: boolean;
+  voiceDuration?: number | null;
+  audioUrl?: string | null;
+  voiceMimeType?: string;
+  voiceSize?: number;
+};
 
 export interface SocketServerRuntime {
   httpServer: http.Server;
@@ -219,8 +241,8 @@ export interface SocketServerRuntime {
 
 export async function createSocketServer(options: SocketServerOptions = {}): Promise<SocketServerRuntime> {
   const isTestMode = process.env.E2E_TEST_MODE === 'true' || process.env.NODE_ENV === 'test';
-  const supabaseUrl = options.supabaseUrl ?? process.env.SUPABASE_URL;
-  const supabaseKey = options.supabaseKey ?? process.env.SUPABASE_ANON_KEY ?? process.env.SUPABASE_KEY;
+  const supabaseUrl = options.supabaseUrl ?? (isTestMode ? undefined : process.env.SUPABASE_URL);
+  const supabaseKey = options.supabaseKey ?? (isTestMode ? undefined : process.env.SUPABASE_ANON_KEY ?? process.env.SUPABASE_KEY);
   const supabaseServiceRoleKey = options.supabaseServiceRoleKey ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
   if ((!supabaseUrl || !supabaseKey) && !isTestMode) throw new Error('Missing required Supabase environment variables: SUPABASE_URL and SUPABASE_KEY or SUPABASE_ANON_KEY.');
 
@@ -236,6 +258,7 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
     ? createClient(supabaseUrl, supabaseServiceRoleKey, { auth: { persistSession: false } })
     : null;
   const intervals = new Set<ReturnType<typeof setInterval>>();
+  const globalTypingUsers = new Set<string>();
 
   io.use(async (socket, next) => {
     const token = parseSocketAuthToken(socket.handshake);
@@ -291,6 +314,14 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
       const roomClient = supabaseAdmin ?? data.supabase;
       if (roomClient) {
         const { data: thread, error } = await roomClient.from('chat_threads').select('id').eq('id', room).or(`user_a.eq.${userId},user_b.eq.${userId}`).maybeSingle();
+                if (room === 'global') {
+                  await socket.join(room);
+                  data.room = room;
+                  const response = { ok: true, room };
+                  ack?.(response);
+                  socket.emit('room_joined', response);
+                  return;
+                }
         if (error || !thread) {
           ack?.({ ok: false, code: 'ROOM_NOT_FOUND' });
           socket.emit('room_error', { code: 'ROOM_NOT_FOUND', message: 'Room not found or access denied' });
@@ -320,16 +351,38 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
     });
 
     socket.on('send_message', async (payload: unknown, ack?: (response: unknown) => void) => {
-      if (!payload || typeof payload !== 'object' || !hasOnlyKeys(payload as Record<string, unknown>, ['room', 'content', 'clientMessageId'])) {
+      if (!payload || typeof payload !== 'object' || !hasOnlyKeys(payload as Record<string, unknown>, ['room', 'content', 'clientMessageId', 'attachments'])) {
         ack?.({ ok: false, code: 'INVALID_PAYLOAD' });
         return;
       }
-      const message = payload as { room?: unknown; content?: unknown; clientMessageId?: unknown };
+      const message = payload as { room?: unknown; content?: unknown; clientMessageId?: unknown; attachments?: unknown };
       const room = typeof message.room === 'string' ? message.room.trim() : '';
       const content = typeof message.content === 'string' ? message.content.trim() : '';
       const clientMessageId = typeof message.clientMessageId === 'string' ? message.clientMessageId : undefined;
       if (!room || !content || data.room !== room || !socket.rooms.has(room)) {
         ack?.({ ok: false, code: 'ROOM_NOT_JOINED' });
+        return;
+      }
+      if (room === 'global') {
+        if (!options.persistGlobalMessage) {
+          ack?.({ ok: false, code: 'GLOBAL_CHAT_UNAVAILABLE' });
+          return;
+        }
+        const canonical: GlobalSocketMessage = {
+          id: crypto.randomUUID(), room: 'global', senderId: userId,
+          senderName: data.username ?? userId, message: content, content,
+          timestamp: new Date().toISOString(),
+          clientMessageId: typeof message.clientMessageId === 'string' ? message.clientMessageId : undefined,
+          attachments: message.attachments,
+        };
+        try {
+          await options.persistGlobalMessage(canonical, data.supabase);
+        } catch (error) {
+          ack?.({ ok: false, code: 'MESSAGE_PERSIST_FAILED', reason: error instanceof Error ? error.message : 'Unable to persist message' });
+          return;
+        }
+        io.to(room).emit('message_received', canonical);
+        ack?.({ ok: true, message: canonical });
         return;
       }
       if (!data.supabase && !options.persistMessage) {
@@ -353,6 +406,90 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
       ack?.({ ok: true, message: canonical });
     });
 
+    socket.on('typing', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object' || data.room !== 'global') return;
+      const isTyping = Boolean((payload as { isTyping?: unknown }).isTyping);
+      if (data.username) {
+        if (isTyping) globalTypingUsers.add(data.username);
+        else globalTypingUsers.delete(data.username);
+      }
+      io.to('global').emit('room_typing_update', { roomId: 'global', users: Array.from(globalTypingUsers) });
+    });
+
+    socket.on('edit_message', async (payload: unknown, ack?: (response: unknown) => void) => {
+      if (!options.updateGlobalMessage || !payload || typeof payload !== 'object' || data.room !== 'global') return;
+      const value = payload as { messageId?: unknown; newMessage?: unknown };
+      const messageId = typeof value.messageId === 'string' ? value.messageId : '';
+      const content = typeof value.newMessage === 'string' ? value.newMessage.trim() : '';
+      if (!messageId || !content) { ack?.({ ok: false, code: 'INVALID_PAYLOAD' }); return; }
+      const updated = await options.updateGlobalMessage(messageId, userId, content, data.supabase);
+      if (!updated) { ack?.({ ok: false, code: 'NOT_MESSAGE_OWNER' }); return; }
+      io.to('global').emit('message_edited', { messageId, newMessage: content });
+      ack?.({ ok: true });
+    });
+
+    socket.on('unsend_message', async (payload: unknown, ack?: (response: unknown) => void) => {
+      if (!options.deleteGlobalMessage || !payload || typeof payload !== 'object' || data.room !== 'global') return;
+      const messageId = typeof (payload as { messageId?: unknown }).messageId === 'string' ? (payload as { messageId: string }).messageId : '';
+      if (!messageId) { ack?.({ ok: false, code: 'INVALID_PAYLOAD' }); return; }
+      const deleted = await options.deleteGlobalMessage(messageId, userId, data.supabase);
+      if (!deleted) { ack?.({ ok: false, code: 'NOT_MESSAGE_OWNER' }); return; }
+      io.to('global').emit('message_unsent', { messageId });
+      ack?.({ ok: true });
+    });
+
+    socket.on('react_message', async (payload: unknown, ack?: (response: unknown) => void) => {
+      if (!options.toggleGlobalReaction || !payload || typeof payload !== 'object' || data.room !== 'global') return;
+      const value = payload as { messageId?: unknown; emoji?: unknown };
+      if (typeof value.messageId !== 'string' || typeof value.emoji !== 'string' || !value.emoji.trim()) { ack?.({ ok: false, code: 'INVALID_PAYLOAD' }); return; }
+      const reactions = await options.toggleGlobalReaction(value.messageId, userId, value.emoji.trim(), data.supabase);
+      io.to('global').emit('message_reaction', { messageId: value.messageId, reactions });
+      ack?.({ ok: true, reactions });
+    });
+
+    socket.on('send_voice_note', async (payload: unknown, ack?: (response: unknown) => void) => {
+      if (!payload || typeof payload !== 'object' || !hasOnlyKeys(payload as Record<string, unknown>, ['room', 'audioUrl', 'duration', 'mimeType', 'size', 'clientMessageId'])) {
+        ack?.({ ok: false, code: 'INVALID_PAYLOAD' });
+        return;
+      }
+      const message = payload as Record<string, unknown>;
+      const room = typeof message.room === 'string' ? message.room.trim() : '';
+      const audioUrl = typeof message.audioUrl === 'string' ? message.audioUrl.trim() : '';
+      const mimeType = typeof message.mimeType === 'string' ? message.mimeType.toLowerCase() : '';
+      const duration = Number(message.duration);
+      const size = Number(message.size);
+      const clientMessageId = typeof message.clientMessageId === 'string' ? message.clientMessageId : undefined;
+      if (!room || data.room !== room || !socket.rooms.has(room) || !audioUrl || !/^audio\//.test(mimeType) || !Number.isFinite(duration) || duration <= 0 || !Number.isFinite(size) || size <= 0 || size > 5 * 1024 * 1024) {
+        ack?.({ ok: false, code: 'INVALID_VOICE_NOTE' });
+        return;
+      }
+      if (!options.persistVoiceNote) {
+        ack?.({ ok: false, code: 'UNAUTHORIZED' });
+        return;
+      }
+      const canonical = { id: crypto.randomUUID(), room, senderId: userId, content: '', timestamp: new Date().toISOString(), voiceNote: true as const, audioUrl, voiceDuration: Math.round(duration), voiceMimeType: mimeType, voiceSize: Math.round(size), clientMessageId };
+      if (room === 'global' && options.persistGlobalMessage) {
+        const globalMessage: GlobalSocketMessage = { ...canonical, room: 'global', senderName: data.username ?? userId, message: audioUrl, content: '' };
+        try {
+          await options.persistGlobalMessage(globalMessage, data.supabase);
+        } catch (error) {
+          ack?.({ ok: false, code: 'MESSAGE_PERSIST_FAILED', reason: error instanceof Error ? error.message : 'Unable to persist voice note' });
+          return;
+        }
+        io.to(room).emit('message_received', globalMessage);
+        ack?.({ ok: true, message: globalMessage });
+        return;
+      }
+      try {
+        await options.persistVoiceNote(canonical);
+      } catch (error) {
+        ack?.({ ok: false, code: 'MESSAGE_PERSIST_FAILED', reason: error instanceof Error ? error.message : 'Unable to persist voice note' });
+        return;
+      }
+      io.to(room).emit('message_received', canonical);
+      ack?.({ ok: true, message: canonical });
+    });
+
     socket.on('mark_as_read', (payload: unknown, ack?: (response: unknown) => void) => {
       if (!payload || typeof payload !== 'object' || !hasOnlyKeys(payload as Record<string, unknown>, ['room', 'messageId'])) {
         ack?.({ ok: false, code: 'INVALID_PAYLOAD' });
@@ -364,6 +501,10 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
     const heartbeat = setInterval(() => socket.emit('heartbeat', { serverTime: Date.now() }), 20_000);
     intervals.add(heartbeat);
     socket.on('disconnect', () => {
+      if (data.username) {
+        globalTypingUsers.delete(data.username);
+        io.to('global').emit('room_typing_update', { roomId: 'global', users: Array.from(globalTypingUsers) });
+      }
       clearInterval(heartbeat);
       intervals.delete(heartbeat);
       activeSockets.delete(socket.id);
