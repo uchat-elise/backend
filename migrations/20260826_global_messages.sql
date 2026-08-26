@@ -20,7 +20,27 @@ create table if not exists public.global_messages (
   )
 );
 
+alter table public.global_messages
+  add column if not exists voice_note boolean not null default false,
+  add column if not exists voice_duration integer,
+  add column if not exists audio_url text,
+  add column if not exists voice_mime_type text,
+  add column if not exists voice_size integer;
+
+alter table public.global_messages
+  drop constraint if exists chk_global_message_content;
+
+alter table public.global_messages
+  add constraint chk_global_message_content check (
+    (voice_note = true and audio_url is not null and length(trim(audio_url)) > 0
+      and voice_duration is not null and voice_duration > 0
+      and voice_size is not null and voice_size > 0 and voice_size <= 5242880
+      and voice_mime_type is not null and voice_mime_type like 'audio/%')
+    or (voice_note = false and length(trim(content)) > 0)
+  );
+
 create index if not exists idx_global_messages_created_at on public.global_messages(created_at desc);
+create index if not exists idx_global_messages_voice_note on public.global_messages(voice_note) where voice_note = true;
 
 alter table public.global_messages enable row level security;
 
@@ -34,7 +54,13 @@ drop policy if exists "Users can insert their global messages" on public.global_
 create policy "Users can insert their global messages"
   on public.global_messages for insert
   to authenticated
-  with check (sender_id = auth.uid());
+  with check (
+    sender_id = auth.uid()
+    and (
+      (voice_note = false and length(trim(content)) > 0)
+      or (voice_note = true and audio_url is not null and length(trim(audio_url)) > 0)
+    )
+  );
 
 drop policy if exists "Users can update their global messages" on public.global_messages;
 create policy "Users can update their global messages"

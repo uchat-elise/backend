@@ -243,6 +243,12 @@ async function getAuthenticatedUserFromRequest(req: Request, requireBearer = fal
       const user = await getUserById(session.userId);
       if (user) return user;
     }
+
+    const username = getAuthenticatedUsername(req);
+    if (username) {
+      const user = await getUserByUsername(username);
+      if (user) return user;
+    }
     return null;
   }
 
@@ -1319,6 +1325,8 @@ function toGlobalMessage(record: GlobalMessageRecord) {
     voiceNote: record.voice_note,
     voiceDuration: record.voice_duration,
     audioUrl: record.audio_url,
+    voiceMimeType: record.voice_mime_type ?? undefined,
+    voiceSize: record.voice_size ?? undefined,
   };
 }
 
@@ -1428,13 +1436,13 @@ async function toggleGlobalReaction(messageId: string, userId: string, emoji: st
 }
 
 async function savePrivateMessage(message: any) {
-  // Generate seq locally (works for both Supabase and in-memory modes)
-  const seq = (inMemoryChatSeqs[message.chatId] = (inMemoryChatSeqs[message.chatId] ?? 0) + 1);
+  const chatId = message.chatId ?? message.room;
+  const seq = (inMemoryChatSeqs[chatId] = (inMemoryChatSeqs[chatId] ?? 0) + 1);
 
   const contentToSave = message.message ?? message.content;
   console.log('[savePrivateMessage] Saving message:', {
     id: message.id,
-    chatId: message.chatId,
+    chatId,
     sender: message.senderId ?? message.senderName,
     contentLength: contentToSave?.length ?? 0,
     seq,
@@ -1447,7 +1455,7 @@ async function savePrivateMessage(message: any) {
         : crypto.randomUUID();
       const realtimeMessageId = await saveMessage(supabase, {
         id: message.dbId,
-        chat_id: message.chatId,
+        chat_id: chatId,
         sender_id: String(message.senderId ?? message.senderName ?? ''),
         content: contentToSave,
         status: 'sent',
@@ -1476,7 +1484,7 @@ async function savePrivateMessage(message: any) {
   console.log('[savePrivateMessage] Storing in-memory fallback');
   inMemoryPrivateMessages.push({
     id: message.id,
-    chatId: message.chatId,
+    chatId,
     sender_username: message.senderId ?? message.senderName,
     sender_display_name: message.senderDisplayName ?? null,
     content: contentToSave,
@@ -1493,7 +1501,7 @@ async function savePrivateMessage(message: any) {
     reply_to: message.replyTo ?? null,
     seq,
   });
-  console.log('[savePrivateMessage] ✓ Saved to in-memory. Total for chat:', inMemoryPrivateMessages.filter(m => m.chatId === message.chatId).length);
+  console.log('[savePrivateMessage] ✓ Saved to in-memory. Total for chat:', inMemoryPrivateMessages.filter(m => m.chatId === chatId).length);
 }
 
 function isUuid(value: unknown): value is string {
