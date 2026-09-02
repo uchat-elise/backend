@@ -56,6 +56,8 @@ const app = express();
 const server = http.createServer(app);
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY ?? process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'chat-media';
 const isTestRuntime = process.env.NODE_ENV === 'test'
   || process.argv.includes('--test')
   || process.execArgv.includes('--test')
@@ -76,6 +78,44 @@ const USE_SUPABASE = process.env.E2E_TEST_MODE !== 'true' && Boolean(SUPABASE_UR
 const supabase = USE_SUPABASE
   ? createClient(SUPABASE_URL as string, SUPABASE_KEY as string, { auth: { persistSession: false } })
   : null;
+const storageClient = USE_SUPABASE && SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL as string, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  : null;
+
+let storageBucketReady: Promise<boolean> | null = null;
+async function ensureStorageBucket() {
+  if (!storageClient) return false;
+  if (!storageBucketReady) {
+    storageBucketReady = (async () => {
+      const { data: buckets, error: listError } = await storageClient.storage.listBuckets();
+      if (listError) throw listError;
+      if (!buckets.some((bucket) => bucket.name === STORAGE_BUCKET)) {
+        const { error } = await storageClient.storage.createBucket(STORAGE_BUCKET, { public: false });
+        if (error && !/already exists/i.test(error.message)) throw error;
+      }
+      return true;
+    })().catch((error) => {
+      storageBucketReady = null;
+      console.error('[storage] Unable to initialize Supabase Storage bucket:', error instanceof Error ? error.message : error);
+      return false;
+    });
+  }
+  return storageBucketReady;
+}
+
+async function uploadStoredMedia(objectPath: string, body: Buffer, contentType: string) {
+  if (!storageClient) {
+    if (USE_SUPABASE) throw new Error('Supabase Storage requires SUPABASE_SERVICE_ROLE_KEY');
+    return false;
+  }
+  if (!(await ensureStorageBucket())) throw new Error('Supabase Storage bucket is unavailable');
+  const { error } = await storageClient.storage.from(STORAGE_BUCKET).upload(objectPath, body, {
+    contentType,
+    upsert: true,
+  });
+  if (error) throw error;
+  return true;
+}
 
 function getRequestSupabaseClient(req: Request) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return supabase;
@@ -606,6 +646,26 @@ app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use('/api/storage', express.static(storageRoot));
 
+app.get('/api/storage/*', async (req: Request, res: Response) => {
+  if (!storageClient) return res.status(404).json({ error: 'Media storage is not configured' });
+  const objectPath = decodeURIComponent((req as any).path || '').replace(/^\/api\/storage\/?/, '');
+  if (!objectPath) return res.status(400).json({ error: 'Missing media path' });
+  try {
+    const { data, error } = await storageClient.storage.from(STORAGE_BUCKET).download(objectPath);
+    if (error || !data) return res.status(404).json({ error: 'Media not found' });
+    const extension = path.extname(objectPath).toLowerCase();
+    const contentTypes: Record<string, string> = {
+      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+      '.webp': 'image/webp', '.webm': 'audio/webm', '.ogg': 'audio/ogg', '.mp4': 'video/mp4',
+      '.m4a': 'audio/mp4', '.wav': 'audio/wav',
+    };
+    res.type(contentTypes[extension] ?? 'application/octet-stream');
+    return res.send(Buffer.from(await data.arrayBuffer()));
+  } catch (error) {
+    return res.status(500).json({ error: error instanceof Error ? error.message : 'Unable to load media' });
+  }
+});
+
 app.post('/api/voice-notes', express.raw({ type: ['audio/*'], limit: '5mb' }), async (req: Request, res: Response) => {
   const currentUser = await getAuthenticatedUserFromRequest(req, true);
   if (!currentUser) return res.status(401).json({ error: 'Unauthorized' });
@@ -615,8 +675,11 @@ app.post('/api/voice-notes', express.raw({ type: ['audio/*'], limit: '5mb' }), a
   if (body.length === 0) return res.status(400).json({ error: 'Empty audio recording' });
   const extension = mimeType.includes('mp4') || mimeType.includes('aac') ? 'm4a' : mimeType.includes('ogg') ? 'ogg' : 'webm';
   const relativePath = `uploads/voice-${currentUser.id}-${Date.now()}-${crypto.randomUUID()}.${extension}`;
-  const targetPath = path.join(storageRoot, relativePath);
-  fs.writeFileSync(targetPath, body);
+  if (!(await uploadStoredMedia(relativePath, body, mimeType))) {
+    const targetPath = path.join(storageRoot, relativePath);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, body);
+  }
   return res.json({ audioUrl: `${PUBLIC_API_URL}/api/storage/${relativePath}`, size: body.length, mimeType, extension });
 });
 
@@ -653,10 +716,13 @@ app.put('/api/storage/*', express.raw({ type: '*/*', limit: '10mb' }), async (re
   const relativePath = decodeURIComponent((req as any).path || '').replace(/^\/api\/storage\/?/, '');
   if (!relativePath) return res.status(400).json({ error: 'Missing upload path' });
 
-  const targetPath = path.join(storageRoot, relativePath);
-  const targetDir = path.dirname(targetPath);
-  fs.mkdirSync(targetDir, { recursive: true });
-  fs.writeFileSync(targetPath, Buffer.from(req.body ?? []));
+  const body = Buffer.from(req.body ?? []);
+  if (!(await uploadStoredMedia(relativePath, body, String(req.headers['content-type'] ?? 'application/octet-stream')))) {
+    const targetPath = path.join(storageRoot, relativePath);
+    const targetDir = path.dirname(targetPath);
+    fs.mkdirSync(targetDir, { recursive: true });
+    fs.writeFileSync(targetPath, body);
+  }
   return res.status(200).json({ ok: true, path: relativePath });
 });
 
@@ -681,6 +747,21 @@ app.get('/api/auth/me', async (req: Request, res: Response) => {
     });
   } catch (error) {
     return res.status(500).json({ error: (error as Error).message || 'Unable to load profile' });
+  }
+});
+
+app.patch('/api/auth/last-seen', async (req: Request, res: Response) => {
+  const currentUsername = getAuthenticatedUsername(req);
+  if (!currentUsername) return res.status(401).json({ error: 'Missing or invalid auth (require Authorization and x-username)' });
+
+  try {
+    const currentUser = await getUserByUsername(currentUsername);
+    if (!currentUser) return res.status(404).json({ error: 'User not found' });
+    const timestamp = typeof req.body?.timestamp === 'string' ? new Date(req.body.timestamp) : new Date();
+    const lastSeen = await updateUserLastSeen(currentUser.id, Number.isNaN(timestamp.getTime()) ? new Date() : timestamp);
+    return res.json({ lastSeen });
+  } catch (error) {
+    return res.status(500).json({ error: (error as Error).message || 'Unable to update last seen' });
   }
 });
 
