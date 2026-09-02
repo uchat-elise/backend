@@ -693,8 +693,10 @@ app.post('/api/storage/uploads/request-url', async (req: Request, res: Response)
 
   if (!fileName) return res.status(400).json({ error: 'Missing file name' });
   if (!Number.isFinite(fileSize) || fileSize <= 0) return res.status(400).json({ error: 'Missing file size' });
-  if (fileSize > 5 * 1024 * 1024) return res.status(413).json({ error: 'Profile image must be under 5 MB' });
-  if (!contentType.startsWith('image/')) return res.status(415).json({ error: 'Profile image must be an image' });
+  if (fileSize > 5 * 1024 * 1024) return res.status(413).json({ error: 'Media file must be under 5 MB' });
+  if (!contentType.startsWith('image/') && !/^audio\/(webm|ogg|mp4|mpeg|aac|wav)$/.test(contentType)) {
+    return res.status(415).json({ error: 'Only images and supported audio files are allowed' });
+  }
 
   const safeName = fileName
     .replace(/\\/g, '/')
