@@ -204,8 +204,8 @@ export interface SocketServerOptions {
   supabaseKey?: string;
   supabaseServiceRoleKey?: string;
   httpServer?: http.Server;
-  persistMessage?: (message: { id: string; room: string; senderId: string; content: string; timestamp: string }) => Promise<void>;
-  persistVoiceNote?: (message: { id: string; room: string; senderId: string; content: string; timestamp: string; voiceNote: true; audioUrl: string; voiceDuration: number; voiceMimeType: string; voiceSize: number; clientMessageId?: string }) => Promise<void>;
+  persistMessage?: (message: { id: string; room: string; senderId: string; content: string; timestamp: string; attachments?: unknown }) => Promise<void>;
+  persistVoiceNote?: (message: { id: string; room: string; senderId: string; content: string; timestamp: string; voiceNote: true; audioUrl: string; voiceDuration: number; voiceMimeType: string; voiceSize: number; clientMessageId?: string }, client: SupabaseClient | null) => Promise<void>;
   persistGlobalMessage?: (message: GlobalSocketMessage, client: SupabaseClient | null) => Promise<void>;
   updateGlobalMessage?: (messageId: string, userId: string, content: string, client: SupabaseClient | null) => Promise<boolean>;
   deleteGlobalMessage?: (messageId: string, userId: string, client: SupabaseClient | null) => Promise<boolean>;
@@ -383,10 +383,10 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
         ack?.(response);
         return;
       }
-      const canonical = { id: crypto.randomUUID(), room, senderId: userId, senderUsername: data.username ?? undefined, content, clientMessageId, timestamp: new Date().toISOString() };
+      const canonical = { id: crypto.randomUUID(), room, senderId: userId, senderUsername: data.username ?? undefined, content, clientMessageId, timestamp: new Date().toISOString(), attachments: message.attachments };
       try {
         if (options.persistMessage) await options.persistMessage(canonical);
-        else await saveMessage(data.supabase as SupabaseClient, { id: canonical.id, chat_id: room, sender_id: userId, content, created_at: canonical.timestamp, client_message_id: clientMessageId ?? canonical.id });
+        else await saveMessage(data.supabase as SupabaseClient, { id: canonical.id, chat_id: room, sender_id: userId, content, attachments: message.attachments, created_at: canonical.timestamp, client_message_id: clientMessageId ?? canonical.id });
       } catch (error) {
         const failure = getMessageSendError(error);
         const response = { ok: false, code: failure.code, reason: failure.reason };
@@ -473,7 +473,7 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
         return;
       }
       try {
-        await options.persistVoiceNote(canonical);
+        await options.persistVoiceNote(canonical, data.supabase);
       } catch (error) {
         ack?.({ ok: false, code: 'MESSAGE_PERSIST_FAILED', reason: error instanceof Error ? error.message : 'Unable to persist voice note' });
         return;

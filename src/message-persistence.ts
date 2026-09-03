@@ -11,6 +11,7 @@ export interface MessagePayload {
   status?: MessageStatus;
   created_at?: string;
   client_message_id?: string;
+  attachments?: unknown;
   audio_url?: string | null;
   voice_note?: boolean;
   voice_duration?: number | null;
@@ -42,6 +43,7 @@ export async function saveMessage(
     status: payload.status ?? 'sent',
     created_at: createdAt,
     client_message_id: clientMessageId,
+    attachments: payload.attachments ?? null,
     audio_url: payload.audio_url ?? null,
     voice_note: payload.voice_note ?? false,
     voice_duration: payload.voice_duration ?? null,

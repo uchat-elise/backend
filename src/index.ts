@@ -9,6 +9,8 @@ import { type Socket } from 'socket.io';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import multer from 'multer';
+import webpush from 'web-push';
 import { activeSockets, createSocketServer, getPrivateRoomId, verifySocketAuthToken } from './socket-server';
 import { getVisibleLastSeen, shouldRefreshLastSeen } from './last-seen';
 import { createMessagePayload, persistMessageWithTransaction, resolveReceiverSocketId, socketUserIdMap } from './message-flow';
@@ -53,11 +55,15 @@ const uploadsRoot = path.join(storageRoot, 'uploads');
 fs.mkdirSync(uploadsRoot, { recursive: true });
 
 const app = express();
+const multipartUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 const server = http.createServer(app);
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY ?? process.env.SUPABASE_ANON_KEY;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'chat-media';
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const PUSH_SUBSCRIPTIONS_TABLE = 'push_subscriptions';
 const isTestRuntime = process.env.NODE_ENV === 'test'
   || process.argv.includes('--test')
   || process.execArgv.includes('--test')
@@ -81,6 +87,28 @@ const supabase = USE_SUPABASE
 const storageClient = USE_SUPABASE && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL as string, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
   : null;
+
+const pushEnabled = Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT);
+if (pushEnabled) webpush.setVapidDetails(process.env.VAPID_SUBJECT as string, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+
+async function sendPushToUsers(userIds: string[] | null, title: string, body: string, url = '/Uchat/', excludedUserId?: string) {
+  if (!pushEnabled || !storageClient) return;
+  const query = storageClient.from(PUSH_SUBSCRIPTIONS_TABLE).select('id,endpoint,p256dh,auth,user_id');
+  const { data: subscriptions, error } = userIds ? await query.in('user_id', userIds) : await query;
+  if (error) {
+    console.error('[push] Unable to load subscriptions:', error.message);
+    return;
+  }
+  await Promise.all((subscriptions ?? []).filter((subscription: any) => subscription.user_id !== excludedUserId).map(async (subscription: any) => {
+    try {
+      await webpush.sendNotification({ endpoint: subscription.endpoint, keys: { p256dh: subscription.p256dh, auth: subscription.auth } }, JSON.stringify({ title, body, url }));
+    } catch (pushError: any) {
+      if (pushError?.statusCode === 404 || pushError?.statusCode === 410) {
+        await storageClient.from(PUSH_SUBSCRIPTIONS_TABLE).delete().eq('id', subscription.id);
+      } else console.error('[push] Delivery failed:', pushError instanceof Error ? pushError.message : pushError);
+    }
+  }));
+}
 
 let storageBucketReady: Promise<boolean> | null = null;
 async function ensureStorageBucket() {
@@ -134,7 +162,7 @@ const socketServer = await createSocketServer({
   corsOrigin: FRONTEND_URL,
   supabaseUrl: USE_SUPABASE ? SUPABASE_URL : undefined,
   supabaseKey: USE_SUPABASE ? SUPABASE_KEY : undefined,
-  persistVoiceNote: async (message) => savePrivateMessage(message),
+  persistVoiceNote: async (message, client) => savePrivateMessage(message, client),
   persistGlobalMessage: (message, client) => persistGlobalMessage(message, client),
   updateGlobalMessage: (messageId, userId, content, client) => updateGlobalMessage(messageId, userId, content, client),
   deleteGlobalMessage: (messageId, userId, client) => deleteGlobalMessage(messageId, userId, client),
@@ -709,6 +737,21 @@ app.post('/api/storage/uploads/request-url', async (req: Request, res: Response)
   const objectPath = `/uploads/${Date.now()}-${Math.random().toString(16).slice(2)}-${safeName}`;
   const uploadURL = `${PUBLIC_API_URL}/api/storage${objectPath}`;
   return res.json({ uploadURL, objectPath });
+});
+
+app.post('/api/uploads', multipartUpload.single('file'), async (req: Request, res: Response) => {
+  const currentUser = await getAuthenticatedUserFromRequest(req, true);
+  if (!currentUser) return res.status(401).json({ error: 'Unauthorized' });
+  const file = (req as Request & { file?: Express.Multer.File }).file;
+  if (!file) return res.status(400).json({ error: 'Missing file' });
+  const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '') || 'upload';
+  const relativePath = `uploads/${currentUser.id}-${Date.now()}-${crypto.randomUUID()}-${safeName}`;
+  if (!(await uploadStoredMedia(relativePath, file.buffer, file.mimetype))) {
+    const targetPath = path.join(storageRoot, relativePath);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, file.buffer);
+  }
+  return res.json({ file: { storedName: path.basename(relativePath), url: `${PUBLIC_API_URL}/api/storage/${relativePath}`, fileName: file.originalname, size: file.size, mimeType: file.mimetype } });
 });
 
 app.put('/api/storage/*', express.raw({ type: '*/*', limit: '10mb' }), async (req: Request, res: Response) => {
@@ -1443,6 +1486,7 @@ async function persistGlobalMessage(message: {
       updated_at: message.timestamp,
     }, { onConflict: 'client_message_id' });
     if (error) throw error;
+    void sendPushToUsers(null, message.senderName, message.voiceNote ? 'Voice message' : message.content, '/Uchat/', message.senderId);
     return;
   }
 
@@ -1464,6 +1508,7 @@ async function persistGlobalMessage(message: {
     created_at: message.timestamp,
     updated_at: message.timestamp,
   });
+  void sendPushToUsers(null, message.senderName, message.voiceNote ? 'Voice message' : message.content, '/Uchat/', message.senderId);
 }
 
 async function updateGlobalMessage(messageId: string, userId: string, content: string, client: SupabaseClient | null) {
@@ -1518,7 +1563,7 @@ async function toggleGlobalReaction(messageId: string, userId: string, emoji: st
   return message.reactions;
 }
 
-async function savePrivateMessage(message: any) {
+async function savePrivateMessage(message: any, messageClient: SupabaseClient | null = supabase) {
   const chatId = message.chatId ?? message.room;
   const seq = (inMemoryChatSeqs[chatId] = (inMemoryChatSeqs[chatId] ?? 0) + 1);
 
@@ -1536,7 +1581,8 @@ async function savePrivateMessage(message: any) {
       const clientMessageId = isUuid(message.clientMessageId)
         ? message.clientMessageId
         : crypto.randomUUID();
-      const realtimeMessageId = await saveMessage(supabase, {
+      if (!messageClient) throw new Error('Supabase client is not initialized');
+      const realtimeMessageId = await saveMessage(messageClient, {
         id: message.dbId,
         chat_id: chatId,
         sender_id: String(message.senderId ?? message.senderName ?? ''),
@@ -1544,6 +1590,7 @@ async function savePrivateMessage(message: any) {
         status: 'sent',
         created_at: message.timestamp,
         client_message_id: clientMessageId,
+        attachments: message.attachments,
         audio_url: message.audioUrl ?? null,
         voice_note: message.voiceNote ?? false,
         voice_duration: message.voiceDuration ?? null,
@@ -1553,6 +1600,11 @@ async function savePrivateMessage(message: any) {
 
       message.dbId = realtimeMessageId;
       message.clientMessageId = clientMessageId;
+      if (storageClient) {
+        const { data: thread } = await storageClient.from('chat_threads').select('user_a,user_b').eq('id', chatId).maybeSingle();
+        const recipientId = thread && (thread.user_a === message.senderId ? thread.user_b : thread.user_a);
+        if (recipientId) void sendPushToUsers([recipientId], message.senderName ?? 'New message', contentToSave || 'Voice message', `/Uchat/messages/${chatId}`);
+      }
       console.log('[savePrivateMessage] ✓ Saved to canonical messages table only');
       return;
     } catch (e) {
@@ -1614,7 +1666,7 @@ async function getPrivateMessageById(messageId: string) {
   if (USE_SUPABASE && supabase) {
     const { data, error } = await supabase
       .from('messages')
-      .select('id,chat_id,sender_id,content,status,created_at,client_message_id,voice_note,audio_url,voice_duration,voice_mime_type,voice_size')
+      .select('id,chat_id,sender_id,content,attachments,status,created_at,client_message_id,voice_note,audio_url,voice_duration,voice_mime_type,voice_size')
       .eq('id', messageId)
       .maybeSingle();
     if (error) throw error;
@@ -1708,7 +1760,7 @@ async function getPrivateMessagesForChat(chatId: string, currentUsername?: strin
     if (!messageClient) throw new Error('Supabase client is not initialized');
     const { data: messages, error } = await messageClient
       .from('messages')
-      .select('id,chat_id,sender_id,content,status,created_at,client_message_id,voice_note,audio_url,voice_duration,voice_mime_type,voice_size')
+      .select('id,chat_id,sender_id,content,attachments,status,created_at,client_message_id,voice_note,audio_url,voice_duration,voice_mime_type,voice_size')
       .eq('chat_id', chatId)
       .order('created_at', { ascending: true });
     if (!error && messages) {
@@ -1775,7 +1827,7 @@ async function getPrivateMessagesForChat(chatId: string, currentUsername?: strin
         senderId: message.sender_id,
         senderName: message.sender_id,
         content: message.content,
-        attachments: undefined,
+        attachments: message.attachments ?? undefined,
         voiceNote: Boolean(message.voice_note),
         audioUrl: message.audio_url ?? null,
         voiceDuration: message.voice_duration ?? null,
@@ -2159,7 +2211,9 @@ app.get('/api/messages', async (req: Request, res: Response) => {
 
   try {
     if (USE_SUPABASE && supabase) {
-      let query = supabase.from('global_messages').select('id,sender_id,content,attachments,reactions,voice_note,voice_duration,audio_url,voice_mime_type,voice_size,unsent,edited,created_at').order('created_at', { ascending: false }).limit(limit + 1);
+      const messageClient = getRequestSupabaseClient(req);
+      if (!messageClient) return res.status(500).json({ error: 'Supabase client is not initialized' });
+      let query = messageClient.from('global_messages').select('id,sender_id,content,attachments,reactions,voice_note,voice_duration,audio_url,voice_mime_type,voice_size,unsent,edited,created_at').order('created_at', { ascending: false }).limit(limit + 1);
       if (before) query = query.lt('created_at', before);
       const { data, error } = await query;
       if (error) throw error;
@@ -2199,7 +2253,9 @@ app.get('/api/messages/stats', async (req: Request, res: Response) => {
   const currentUser = await getAuthenticatedUserFromRequest(req, true);
   if (!currentUser) return res.status(401).json({ error: 'Unauthorized' });
   if (USE_SUPABASE && supabase) {
-    const { count, error } = await supabase.from('global_messages').select('id', { count: 'exact', head: true });
+    const messageClient = getRequestSupabaseClient(req);
+    if (!messageClient) return res.status(500).json({ error: 'Supabase client is not initialized' });
+    const { count, error } = await messageClient.from('global_messages').select('id', { count: 'exact', head: true });
     if (error) return res.status(500).json({ error: error.message });
     return res.json({ onlineCount: getOnlineUsers().length, totalMessages: count ?? 0, activeRooms: 1 });
   }
