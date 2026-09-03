@@ -172,13 +172,10 @@ async function createAuthenticatedSupabaseClient(
   supabaseAnonKey: string,
   accessToken: string,
 ): Promise<SupabaseClient> {
-  const client = createClient(supabaseUrl, supabaseAnonKey, {
+  return createClient(supabaseUrl, supabaseAnonKey, {
     auth: { persistSession: false, autoRefreshToken: false },
     global: { headers: { Authorization: `Bearer ${accessToken}` } },
   });
-  const { error } = await client.auth.setSession({ access_token: accessToken, refresh_token: '' });
-  if (error) throw new Error(`Supabase authentication failed: ${error.message}`);
-  return client;
 }
 
 async function attachRedisAdapter(io: Server) {
@@ -273,12 +270,7 @@ export async function createSocketServer(options: SocketServerOptions = {}): Pro
     let userSupabase: SupabaseClient | null = null;
     if (supabaseUrl && supabaseKey && token) {
       try {
-        try {
-          readJwtPayload(token);
-          userSupabase = supabase;
-        } catch {
-          userSupabase = await createAuthenticatedSupabaseClient(supabaseUrl, supabaseKey, token);
-        }
+        userSupabase = await createAuthenticatedSupabaseClient(supabaseUrl, supabaseKey, token);
       } catch (error) {
         const authError = new Error(error instanceof Error ? error.message : 'Supabase authentication failed') as Error & { data?: unknown };
         authError.data = { code: 'INVALID_TOKEN', status: 401 };
