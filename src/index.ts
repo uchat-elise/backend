@@ -717,7 +717,7 @@ app.post('/api/storage/uploads/request-url', async (req: Request, res: Response)
 
   const fileName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
   const fileSize = Number(req.body?.size ?? 0);
-  const contentType = typeof req.body?.contentType === 'string' ? req.body.contentType.toLowerCase() : '';
+  const contentType = typeof req.body?.contentType === 'string' ? req.body.contentType.split(';', 1)[0].trim().toLowerCase() : '';
 
   if (!fileName) return res.status(400).json({ error: 'Missing file name' });
   if (!Number.isFinite(fileSize) || fileSize <= 0) return res.status(400).json({ error: 'Missing file size' });
