@@ -87,6 +87,9 @@ const supabase = USE_SUPABASE
 const storageClient = USE_SUPABASE && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL as string, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
   : null;
+// API routes use the backend's application auth, so database reads and writes
+// must use the service-role client instead of a Supabase Auth/RLS client.
+const databaseClient = storageClient ?? supabase;
 
 const pushEnabled = Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT);
 if (pushEnabled) webpush.setVapidDetails(process.env.VAPID_SUBJECT as string, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
@@ -334,8 +337,8 @@ const getChatIdForUsers = (userId1: string, userId2: string) => `chat-${[userId1
 async function hasActivePrivateChatRelationship(userId: string, targetUserId: string) {
   if (!userId || !targetUserId || userId === targetUserId) return false;
 
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('friend_requests')
       .select('id')
       .eq('status', 'accepted')
@@ -352,8 +355,8 @@ async function hasActivePrivateChatRelationship(userId: string, targetUserId: st
 }
 
 async function getUserByUsername(username: string) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('users')
       .select('id,email,username,display_name,profile_picture,avatar_url,password_hash,created_at,last_seen,hide_last_seen,show_online_status')
       .eq('username', username)
@@ -378,8 +381,8 @@ async function getUserByUsername(username: string) {
 }
 
 async function getUserById(id: string) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('users')
       .select('id,email,username,display_name,profile_picture,avatar_url,created_at,last_seen,hide_last_seen,show_online_status')
       .eq('id', id)
@@ -407,7 +410,7 @@ async function resolveUserIdForBackend(value: string | null | undefined) {
   const normalizedValue = typeof value === 'string' ? value.trim() : '';
   if (!normalizedValue) return null;
   if (isUuid(normalizedValue)) return normalizedValue;
-  if (USE_SUPABASE && supabase) return resolveUserId(supabase, normalizedValue);
+  if (USE_SUPABASE && databaseClient) return resolveUserId(databaseClient, normalizedValue);
   return (await getUserByUsername(normalizedValue))?.id ?? null;
 }
 
@@ -422,8 +425,8 @@ async function updateUserLastSeen(userId: string, timestamp = new Date()) {
 
   const iso = timestamp.toISOString();
 
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('users')
       .update({ last_seen: iso, updated_at: iso })
       .eq('id', userId)
@@ -444,8 +447,8 @@ function getOnlineUsers() {
 }
 
 async function getFriendRequestsForUser(currentUserId: string, status?: FriendRequestStatus) {
-  if (USE_SUPABASE && supabase) {
-    let query = supabase.from('friend_requests').select('id,sender_id,receiver_id,status,created_at,updated_at');
+  if (USE_SUPABASE && databaseClient) {
+    let query = databaseClient.from('friend_requests').select('id,sender_id,receiver_id,status,created_at,updated_at');
     if (status) query = query.eq('status', status);
     query = query.or(`sender_id.eq.${currentUserId},receiver_id.eq.${currentUserId}`);
     const { data, error } = await query;
@@ -466,8 +469,8 @@ async function getFriendRequestsForUser(currentUserId: string, status?: FriendRe
 }
 
 async function getFriendRequestById(requestId: string) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('friend_requests')
       .select('id,sender_id,receiver_id,status,created_at,updated_at')
       .eq('id', requestId)
@@ -506,8 +509,8 @@ async function createFriendRequest(senderId: string, receiverId: string) {
     }
   }
 
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('friend_requests')
       .insert([{ sender_id: senderId, receiver_id: receiverId, status: 'pending' }])
       .select('id,sender_id,receiver_id,status,created_at,updated_at')
@@ -536,8 +539,8 @@ async function createFriendRequest(senderId: string, receiverId: string) {
 }
 
 async function updateFriendRequestStatus(requestId: string, status: FriendRequestStatus) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('friend_requests')
       .update({ status, updated_at: new Date().toISOString() })
       .eq('id', requestId)
@@ -565,9 +568,9 @@ export async function rejectRequest(
   requestId: string,
   currentUserId: string,
 ): Promise<void> {
-  if (!supabase) throw new Error('Supabase client is not initialized.');
+  if (!databaseClient) throw new Error('Supabase client is not initialized.');
 
-  const { data: requestData, error: fetchError } = await supabase
+  const { data: requestData, error: fetchError } = await databaseClient
     .from('friend_requests')
     .select('id,sender_id,receiver_id,status')
     .eq('id', requestId)
@@ -582,7 +585,7 @@ export async function rejectRequest(
     throw new Error('Only pending requests may be rejected.');
   }
 
-  const { error: deleteError } = await supabase
+  const { error: deleteError } = await databaseClient
     .from('friend_requests')
     .delete()
     .eq('id', requestId);
@@ -599,8 +602,8 @@ async function getFriendRelationship(currentUserId: string, targetUserId: string
 }
 
 async function getAcceptedFriendChats(currentUserId: string) {
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('friend_requests')
       .select('sender_id,receiver_id')
       .or(`sender_id.eq.${currentUserId},receiver_id.eq.${currentUserId}`)
@@ -609,7 +612,7 @@ async function getAcceptedFriendChats(currentUserId: string) {
     const ids = (data ?? []).flatMap((request: any) => [request.sender_id, request.receiver_id]).filter((id: string) => id !== currentUserId);
     const uniqueIds = Array.from(new Set(ids));
     const users = uniqueIds.length > 0 ? await (async () => {
-      const { data: userData, error: usersError } = await supabase
+      const { data: userData, error: usersError } = await databaseClient
         .from('users')
         .select('id,username,display_name,profile_picture,avatar_url,last_seen,hide_last_seen,show_online_status')
         .in('id', uniqueIds);
@@ -654,8 +657,8 @@ async function getAcceptedFriendChats(currentUserId: string) {
 async function findChatByParticipants(userAId: string, userBId: string) {
   const chatId = getChatIdForUsers(userAId, userBId);
   // For Supabase mode, we can check friend_requests table for accepted status
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('friend_requests')
       .select('id,sender_id,receiver_id,status')
       .or(`sender_id.eq.${userAId},receiver_id.eq.${userAId}`)
@@ -1312,8 +1315,8 @@ const PRESENCE_DISCONNECT_DEBOUNCE_MS = 7000;
 
 async function isChatParticipant(chatId: string, userId: string) {
   if (!chatId || !userId) return false;
-  if (USE_SUPABASE && supabase) {
-    const { data, error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient
       .from('chat_threads')
       .select('user_a,user_b')
       .eq('id', chatId)
@@ -1328,8 +1331,8 @@ async function isChatParticipant(chatId: string, userId: string) {
 
 async function setPresenceStatus(userId: string, online: boolean) {
   const timestamp = new Date().toISOString();
-  if (USE_SUPABASE && supabase) {
-    const { error } = await supabase
+  if (USE_SUPABASE && databaseClient) {
+    const { error } = await databaseClient
       .from('users')
       .update({ is_online: online, status: online ? 'online' : 'offline', last_seen: timestamp, updated_at: timestamp })
       .eq('id', userId);
@@ -1469,9 +1472,9 @@ async function persistGlobalMessage(message: {
   audioUrl?: string | null;
   voiceMimeType?: string;
   voiceSize?: number;
-}, client: SupabaseClient | null) {
-  if (USE_SUPABASE && client) {
-    const { error } = await client.from('global_messages').upsert({
+}, _client: SupabaseClient | null) {
+  if (USE_SUPABASE && databaseClient) {
+    const { error } = await databaseClient.from('global_messages').upsert({
       id: message.id,
       sender_id: message.senderId,
       content: message.content,
@@ -1511,9 +1514,9 @@ async function persistGlobalMessage(message: {
   void sendPushToUsers(null, message.senderName, message.voiceNote ? 'Voice message' : message.content, '/Uchat/', message.senderId);
 }
 
-async function updateGlobalMessage(messageId: string, userId: string, content: string, client: SupabaseClient | null) {
-  if (USE_SUPABASE && client) {
-    const { data, error } = await client.from('global_messages').update({ content, edited: true, updated_at: new Date().toISOString() }).eq('id', messageId).eq('sender_id', userId).select('id').maybeSingle();
+async function updateGlobalMessage(messageId: string, userId: string, content: string, _client: SupabaseClient | null) {
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient.from('global_messages').update({ content, edited: true, updated_at: new Date().toISOString() }).eq('id', messageId).eq('sender_id', userId).select('id').maybeSingle();
     if (error) throw error;
     return Boolean(data);
   }
@@ -1525,9 +1528,9 @@ async function updateGlobalMessage(messageId: string, userId: string, content: s
   return true;
 }
 
-async function deleteGlobalMessage(messageId: string, userId: string, client: SupabaseClient | null) {
-  if (USE_SUPABASE && client) {
-    const { data, error } = await client.from('global_messages').update({ unsent: true, content: 'This message was deleted', updated_at: new Date().toISOString() }).eq('id', messageId).eq('sender_id', userId).select('id').maybeSingle();
+async function deleteGlobalMessage(messageId: string, userId: string, _client: SupabaseClient | null) {
+  if (USE_SUPABASE && databaseClient) {
+    const { data, error } = await databaseClient.from('global_messages').update({ unsent: true, content: 'This message was deleted', updated_at: new Date().toISOString() }).eq('id', messageId).eq('sender_id', userId).select('id').maybeSingle();
     if (error) throw error;
     return Boolean(data);
   }
@@ -1576,13 +1579,13 @@ async function savePrivateMessage(message: any, messageClient: SupabaseClient | 
     seq,
   });
 
-  if (USE_SUPABASE && supabase) {
+  if (USE_SUPABASE && databaseClient) {
     try {
       const clientMessageId = isUuid(message.clientMessageId)
         ? message.clientMessageId
         : crypto.randomUUID();
-      if (!messageClient) throw new Error('Supabase client is not initialized');
-      const realtimeMessageId = await saveMessage(messageClient, {
+      if (!databaseClient) throw new Error('Supabase client is not initialized');
+      const realtimeMessageId = await saveMessage(databaseClient, {
         id: message.dbId,
         chat_id: chatId,
         sender_id: String(message.senderId ?? message.senderName ?? ''),
@@ -1756,7 +1759,7 @@ async function getPrivateMessagesForChat(chatId: string, currentUsername?: strin
   console.log('[getPrivateMessagesForChat] Fetching for:', { chatId, currentUsername, currentUserId, useSupabase: USE_SUPABASE });
   
   if (USE_SUPABASE && supabase) {
-    const messageClient = getRequestSupabaseClient(req as Request);
+    const messageClient = databaseClient;
     if (!messageClient) throw new Error('Supabase client is not initialized');
     const { data: messages, error } = await messageClient
       .from('messages')
@@ -2088,8 +2091,8 @@ app.delete('/api/friends/requests/:requestId', async (req: Request, res: Respons
     if (request.senderId !== currentUser.id) return res.status(403).json({ error: 'Not authorized to cancel this request' });
 
     // Delete the request
-    if (USE_SUPABASE && supabase) {
-      const { error: deleteError } = await supabase.from('friend_requests').delete().eq('id', requestId);
+    if (USE_SUPABASE && databaseClient) {
+      const { error: deleteError } = await databaseClient.from('friend_requests').delete().eq('id', requestId);
       if (deleteError) throw deleteError;
     } else {
       const idx = inMemoryFriendRequests.findIndex((r) => r.id === requestId);
@@ -2210,8 +2213,8 @@ app.get('/api/messages', async (req: Request, res: Response) => {
   if (before && Number.isNaN(Date.parse(before))) return res.status(400).json({ error: 'Invalid before timestamp' });
 
   try {
-    if (USE_SUPABASE && supabase) {
-      const messageClient = getRequestSupabaseClient(req);
+      if (USE_SUPABASE && databaseClient) {
+        const messageClient = databaseClient;
       if (!messageClient) return res.status(500).json({ error: 'Supabase client is not initialized' });
       let query = messageClient.from('global_messages').select('id,sender_id,content,attachments,reactions,voice_note,voice_duration,audio_url,voice_mime_type,voice_size,unsent,edited,created_at').order('created_at', { ascending: false }).limit(limit + 1);
       if (before) query = query.lt('created_at', before);
@@ -2272,8 +2275,8 @@ app.get('/api/messages/sync', async (req: Request, res: Response) => {
   if (Number.isNaN(Date.parse(lastSyncedAt))) return res.status(400).json({ error: 'Invalid last_synced_at' });
 
   try {
-    if (USE_SUPABASE && supabase) {
-      const messageClient = getRequestSupabaseClient(req);
+    if (USE_SUPABASE && databaseClient) {
+      const messageClient = databaseClient;
       if (!messageClient) return res.status(500).json({ error: 'Supabase client is not initialized' });
       const { data: thread, error: threadError } = await messageClient
         .from('chat_threads')
@@ -2645,9 +2648,9 @@ export async function sendMessageController({
         });
       },
       updateConversationLastMessage: async () => {
-        if (USE_SUPABASE && supabase) {
+        if (USE_SUPABASE && databaseClient) {
           const targetChatId = chatId ?? `chat-${[senderId, receiverId].sort().join('-')}`;
-          const { error } = await supabase.from('chat_threads').update({ updated_at: timestamp }).eq('id', targetChatId);
+          const { error } = await databaseClient.from('chat_threads').update({ updated_at: timestamp }).eq('id', targetChatId);
           if (error) throw error;
           return;
         }
